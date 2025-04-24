@@ -4,21 +4,30 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
+	token "github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/mr-tron/base58"
 )
 
 // pumpSwapProgramID is the program ID for PumpSwap AMM
 const pumpSwapProgramID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
+// Token metadata program ID
+const tokenMetadataProgramID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
 
 // Fallback RPC endpoints in case the primary one fails
 var fallbackRPCEndpoints = []string{
@@ -40,6 +49,52 @@ var (
 	SellDiscriminator       = []byte{143, 244, 89, 80, 224, 16, 16, 88}  // Example value - replace with correct one
 	CreatePoolDiscriminator = []byte{175, 175, 109, 31, 13, 152, 155, 9} // Example value - replace with correct one
 )
+
+// TokenInfo represents detailed information about a token
+type TokenInfo struct {
+	Symbol      string
+	Name        string
+	Decimals    uint8
+	Description string
+	Image       string
+	Website     string
+	Twitter     string
+	Telegram    string
+}
+
+// TokenMetadata represents token metadata from the chain
+type TokenMetadata struct {
+	Key        uint8    `json:"key"`
+	UpdateAuth string   `json:"update_auth"`
+	Mint       string   `json:"mint"`
+	Data       MetaData `json:"data"`
+}
+
+// MetaData represents the core metadata fields
+type MetaData struct {
+	Name   string `json:"name"`
+	Symbol string `json:"symbol"`
+	Uri    string `json:"uri"`
+}
+
+// TokenUriData represents the JSON structure from a token's URI
+type TokenUriData struct {
+	Name        string `json:"name"`
+	Symbol      string `json:"symbol"`
+	Description string `json:"description"`
+	Image       string `json:"image"`
+	Website     string `json:"website"`
+	Twitter     string `json:"twitter"`
+	Telegram    string `json:"telegram"`
+	Extensions  struct {
+		Website  string `json:"website"`
+		Twitter  string `json:"twitter"`
+		Telegram string `json:"telegram"`
+	} `json:"extensions"`
+}
+
+// TokenCache to avoid redundant lookups during a session
+var tokenCache = make(map[string]*TokenInfo)
 
 func main() {
 	// Display usage information if requested
@@ -253,7 +308,7 @@ func getHistoricalTransactions(ctx context.Context, rpcEndpoint, accountAddress 
 		}
 
 		// Process the transaction
-		analyzeTransaction(tx, sig.Signature.String())
+		analyzeTransactionWithRPC(tx, sig.Signature.String(), rpcEndpoint)
 	}
 
 	return nil
@@ -261,6 +316,17 @@ func getHistoricalTransactions(ctx context.Context, rpcEndpoint, accountAddress 
 
 // analyzeTransaction analyzes a transaction to identify PumpFun AMM operations
 func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
+	// Call overload with default RPC endpoint
+	rpcEndpoint := os.Getenv("RPC_ENDPOINT")
+	if rpcEndpoint == "" {
+		rpcEndpoint = fallbackRPCEndpoints[0]
+	}
+
+	analyzeTransactionWithRPC(tx, signature, rpcEndpoint)
+}
+
+// analyzeTransactionWithRPC analyzes a transaction with a specific RPC endpoint
+func analyzeTransactionWithRPC(tx *rpc.GetTransactionResult, signature string, rpcEndpoint string) {
 	if tx == nil {
 		fmt.Println("Transaction data is nil")
 		return
@@ -294,6 +360,7 @@ func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
 			AmountIn     uint64
 			AmountOut    uint64
 			BaseMintName string
+			TokenInfo    *TokenInfo
 		}
 
 		summary := TransactionSummary{
@@ -461,6 +528,10 @@ func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
 
 								fmt.Printf("  Instruction type: %s\n", instructionType)
 
+								// Create a context for token info retrieval
+								ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+								defer cancel()
+
 								// Display accounts with their roles
 								for j, accIdx := range inst.Accounts {
 									if int(accIdx) < len(decodedTx.Message.AccountKeys) {
@@ -472,7 +543,23 @@ func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
 
 											// Capture the Base Mint for the summary
 											if accountRoles[j] == "Base Mint (Token)" {
-												summary.BaseMint = account.String()
+												tokenAddress := account.String()
+												summary.BaseMint = tokenAddress
+
+												// Get token info if we haven't already
+												if summary.TokenInfo == nil {
+													// Try to get token info from RPC endpoint
+													tokenInfo, err := getTokenInfo(ctx, rpcEndpoint, tokenAddress)
+													if err != nil {
+														fmt.Printf("  Error getting token info: %v\n", err)
+													} else if tokenInfo != nil {
+														summary.TokenInfo = tokenInfo
+														summary.BaseMintName = tokenInfo.Name
+														if summary.BaseMintName == "" {
+															summary.BaseMintName = tokenInfo.Symbol
+														}
+													}
+												}
 											}
 										} else {
 											fmt.Printf("    Account %d: %s\n", j, account.String())
@@ -509,22 +596,57 @@ func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
 
 		// Display optimized transaction summary in a clear, formatted box
 		fmt.Println("\n┌────────────────── TRANSACTION SUMMARY ──────────────────┐")
+
+		// Display token details if available
+		tokenName := "Unknown Token"
+		if summary.TokenInfo != nil {
+			if summary.TokenInfo.Name != "" {
+				tokenName = summary.TokenInfo.Name
+			} else if summary.TokenInfo.Symbol != "" {
+				tokenName = summary.TokenInfo.Symbol
+			}
+		}
+
 		fmt.Printf("│ Operation:  %-47s │\n", summary.Operation)
 		fmt.Printf("│ Direction:  %-47s │\n", summary.Direction)
 		fmt.Printf("│ Base Mint:  %-47s │\n", summary.BaseMint)
+		fmt.Printf("│ Token Name: %-47s │\n", tokenName)
+
+		// Show token symbol if available
+		if summary.TokenInfo != nil && summary.TokenInfo.Symbol != "" {
+			fmt.Printf("│ Symbol:     %-47s │\n", summary.TokenInfo.Symbol)
+		}
 
 		// Format amounts differently based on whether it's Buy or Sell
 		if isBuy {
 			// For Buy, SOL amount in (lamports) and token amount out
 			solAmount := float64(summary.AmountIn) / 1_000_000_000 // Convert lamports to SOL
 			fmt.Printf("│ Amount In:  %-12.9f SOL %-30s │\n", solAmount, "")
-			// Most tokens use 6 decimals, but this is a simplification
-			tokenAmount := float64(summary.AmountOut) / 1_000_000
-			fmt.Printf("│ Amount Out: %-12.6f Token %-28s │\n", tokenAmount, "")
+
+			// Use token decimals if available, otherwise default to 6
+			tokenDecimals := 6
+			if summary.TokenInfo != nil && summary.TokenInfo.Decimals > 0 {
+				tokenDecimals = int(summary.TokenInfo.Decimals)
+			}
+			tokenAmount := float64(summary.AmountOut) / math.Pow(10, float64(tokenDecimals))
+			symbolStr := "Token"
+			if summary.TokenInfo != nil && summary.TokenInfo.Symbol != "" {
+				symbolStr = strings.TrimSpace(summary.TokenInfo.Symbol)
+			}
+			fmt.Printf("│ Amount Out: %-12.*f %s %-26s │\n", tokenDecimals, tokenAmount, symbolStr, "")
 		} else if isSell {
 			// For Sell, token amount in and SOL amount out (lamports)
-			tokenAmount := float64(summary.AmountIn) / 1_000_000
-			fmt.Printf("│ Amount In:  %-12.6f Token %-28s │\n", tokenAmount, "")
+			tokenDecimals := 6
+			if summary.TokenInfo != nil && summary.TokenInfo.Decimals > 0 {
+				tokenDecimals = int(summary.TokenInfo.Decimals)
+			}
+			tokenAmount := float64(summary.AmountIn) / math.Pow(10, float64(tokenDecimals))
+			symbolStr := "Token"
+			if summary.TokenInfo != nil && summary.TokenInfo.Symbol != "" {
+				symbolStr = strings.TrimSpace(summary.TokenInfo.Symbol)
+			}
+			fmt.Printf("│ Amount In:  %-12.*f %s %-26s │\n", tokenDecimals, tokenAmount, symbolStr, "")
+
 			solAmount := float64(summary.AmountOut) / 1_000_000_000
 			fmt.Printf("│ Amount Out: %-12.9f SOL %-30s │\n", solAmount, "")
 		} else {
@@ -533,7 +655,87 @@ func analyzeTransaction(tx *rpc.GetTransactionResult, signature string) {
 			fmt.Printf("│ Amount Out: %-47d │\n", summary.AmountOut)
 		}
 
+		// Add separator for token information section if we have any social info
+		hasTokenInfo := summary.TokenInfo != nil &&
+			(summary.TokenInfo.Description != "" ||
+				summary.TokenInfo.Website != "" ||
+				summary.TokenInfo.Twitter != "" ||
+				summary.TokenInfo.Telegram != "" ||
+				summary.TokenInfo.Image != "")
+
+		if hasTokenInfo {
+			fmt.Println("├──────────────── TOKEN SOCIAL INFORMATION ───────────────┤")
+
+			// Add token description if available
+			if summary.TokenInfo.Description != "" {
+				desc := summary.TokenInfo.Description
+				// Handle multi-line description by truncating and adding ellipsis
+				if len(desc) > 47 {
+					// Print first line with ellipsis
+					fmt.Printf("│ Description: %-46s │\n", desc[:44]+"...")
+
+					// Print additional lines if really long
+					if len(desc) > 90 {
+						fmt.Printf("│             %-47s │\n", desc[44:90]+"...")
+					} else if len(desc) > 44 {
+						fmt.Printf("│             %-47s │\n", desc[44:])
+					}
+				} else {
+					fmt.Printf("│ Description: %-46s │\n", desc)
+				}
+			} else {
+				fmt.Printf("│ Description: %-46s │\n", "Not available")
+			}
+
+			// Add image if available
+			if summary.TokenInfo.Image != "" {
+				// Truncate long image URLs
+				imgUrl := summary.TokenInfo.Image
+				if len(imgUrl) > 47 {
+					imgUrl = imgUrl[:44] + "..."
+				}
+				fmt.Printf("│ Image:       %-46s │\n", imgUrl)
+			}
+
+			// Add website if available
+			if summary.TokenInfo.Website != "" {
+				website := summary.TokenInfo.Website
+				// Format website URL
+				if len(website) > 47 {
+					website = website[:44] + "..."
+				}
+				fmt.Printf("│ Website:     %-46s │\n", website)
+			} else {
+				fmt.Printf("│ Website:     %-46s │\n", "Not available")
+			}
+
+			// Add social links with clear formatting
+			twitterInfo := "Not available"
+			if summary.TokenInfo.Twitter != "" {
+				twitterInfo = summary.TokenInfo.Twitter
+			}
+			fmt.Printf("│ Twitter:     %-46s │\n", twitterInfo)
+
+			telegramInfo := "Not available"
+			if summary.TokenInfo.Telegram != "" {
+				telegramInfo = summary.TokenInfo.Telegram
+			}
+			fmt.Printf("│ Telegram:    %-46s │\n", telegramInfo)
+		}
+
 		fmt.Println("└──────────────────────────────────────────────────────────┘")
+
+		// If we have token info but didn't show it in the summary (maybe there was a lot),
+		// display additional details here
+		if summary.TokenInfo != nil && summary.TokenInfo.Description != "" && len(summary.TokenInfo.Description) > 90 {
+			fmt.Println("\nFull Token Description:")
+			fmt.Println(summary.TokenInfo.Description)
+		}
+
+		if summary.TokenInfo != nil && summary.TokenInfo.Image != "" {
+			fmt.Println("\nToken Image URL:")
+			fmt.Println(summary.TokenInfo.Image)
+		}
 	} else {
 		fmt.Println("No transaction metadata available")
 	}
@@ -576,7 +778,7 @@ func decodeSpecificTransaction(ctx context.Context, rpcEndpoint, signatureStr st
 	}
 
 	fmt.Printf("Decoding transaction: %s\n", signatureStr)
-	analyzeTransaction(tx, signatureStr)
+	analyzeTransactionWithRPC(tx, signatureStr, rpcEndpoint)
 	return nil
 }
 
@@ -606,4 +808,251 @@ Examples:
   tx_decoder decode H9d3XHfvMGfoohydEpqh4w3mopnvjCRzE9VqaiHKdqs7
   tx_decoder decode-tx 5SHT9PwxFE7BNmSQwU4KjAW16LQ5aEZmUvWKqSCamXKkWQBs1DcYkEv7ujWgASRUUKqYy6VsM7iTgJkgAygCVPZB
 `)
+}
+
+// getTokenInfo retrieves detailed token information by mint address
+func getTokenInfo(ctx context.Context, rpcEndpoint string, mintAddress string) (*TokenInfo, error) {
+	// Check cache first
+	if cachedInfo, exists := tokenCache[mintAddress]; exists {
+		return cachedInfo, nil
+	}
+
+	// Create RPC client
+	client := rpc.New(rpcEndpoint)
+
+	// Get token mint account info
+	mintPubkey, err := solana.PublicKeyFromBase58(mintAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invalid mint address: %w", err)
+	}
+
+	// Get mint account data
+	mintAccount, err := client.GetAccountInfo(ctx, mintPubkey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get mint account: %w", err)
+	}
+
+	if mintAccount.Value == nil || len(mintAccount.Value.Data.GetBinary()) == 0 {
+		return nil, fmt.Errorf("mint account data is empty")
+	}
+
+	// Parse token mint data
+	var mint token.Mint
+	err = bin.NewBinDecoder(mintAccount.Value.Data.GetBinary()).Decode(&mint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode mint data: %w", err)
+	}
+
+	// Create token info with decimals
+	tokenInfo := &TokenInfo{
+		Decimals: mint.Decimals,
+	}
+
+	// Get token metadata account
+	metadataPDA, err := findTokenMetadataAddress(mintPubkey)
+	if err != nil {
+		// Just return basic token info if metadata can't be found
+		tokenCache[mintAddress] = tokenInfo
+		return tokenInfo, nil
+	}
+
+	// Get metadata account info
+	metadataAccount, err := client.GetAccountInfo(ctx, metadataPDA)
+	if err != nil || metadataAccount.Value == nil {
+		// Just return basic token info if metadata account can't be found
+		tokenCache[mintAddress] = tokenInfo
+		return tokenInfo, nil
+	}
+
+	// Parse metadata
+	if len(metadataAccount.Value.Data.GetBinary()) > 0 {
+		metadata, err := decodeTokenMetadata(metadataAccount.Value.Data.GetBinary())
+
+		if err == nil && metadata != nil {
+			tokenInfo.Name = metadata.Data.Name
+			tokenInfo.Symbol = metadata.Data.Symbol
+
+			// Try to fetch extended metadata from URI if available
+			if metadata.Data.Uri != "" {
+				extendedInfo, err := fetchTokenUriData(metadata.Data.Uri)
+				fmt.Printf("extendedInfo: %v\n", extendedInfo)
+				if err == nil && extendedInfo != nil {
+					// Update with extended info
+					if tokenInfo.Name == "" {
+						tokenInfo.Name = extendedInfo.Name
+					}
+					if tokenInfo.Symbol == "" {
+						tokenInfo.Symbol = extendedInfo.Symbol
+					}
+					tokenInfo.Description = extendedInfo.Description
+					tokenInfo.Image = extendedInfo.Image
+					tokenInfo.Website = extendedInfo.Website
+					tokenInfo.Twitter = extendedInfo.Twitter
+					tokenInfo.Telegram = extendedInfo.Telegram
+
+					// Check extensions if main fields are empty
+					if tokenInfo.Website == "" {
+						tokenInfo.Website = extendedInfo.Extensions.Website
+					}
+					if tokenInfo.Twitter == "" {
+						tokenInfo.Twitter = extendedInfo.Extensions.Twitter
+					}
+					if tokenInfo.Telegram == "" {
+						tokenInfo.Telegram = extendedInfo.Extensions.Telegram
+					}
+				}
+			}
+		}
+	}
+
+	// Trim whitespace from fields
+	tokenInfo.Name = strings.TrimSpace(tokenInfo.Name)
+	tokenInfo.Symbol = strings.TrimSpace(tokenInfo.Symbol)
+
+	// Cache the result
+	tokenCache[mintAddress] = tokenInfo
+	return tokenInfo, nil
+}
+
+// findTokenMetadataAddress calculates the PDA for a token's metadata account
+func findTokenMetadataAddress(mint solana.PublicKey) (solana.PublicKey, error) {
+	metadataProgramID := solana.MustPublicKeyFromBase58(tokenMetadataProgramID)
+	seeds := [][]byte{
+		[]byte("metadata"),
+		metadataProgramID.Bytes(),
+		mint.Bytes(),
+	}
+
+	addr, _, err := solana.FindProgramAddress(seeds, metadataProgramID)
+	if err != nil {
+		return solana.PublicKey{}, fmt.Errorf("failed to find PDA: %w", err)
+	}
+
+	return addr, nil
+}
+
+// decodeTokenMetadata decodes the binary metadata into a structured format
+func decodeTokenMetadata(data []byte) (*TokenMetadata, error) {
+	if len(data) < 1 {
+		return nil, fmt.Errorf("metadata too short")
+	}
+
+	// The data format follows this pattern:
+	// byte 0: key (1 byte)
+	// next 32 bytes: update authority
+	// next 32 bytes: mint
+	// then variable length name, symbol, uri
+
+	// This is a simplified decoder that may not work for all tokens
+	// A complete implementation would use the proper layout from the metaplex codebase
+	metadata := &TokenMetadata{
+		Key: data[0],
+	}
+
+	if len(data) < 65 {
+		return metadata, nil
+	}
+
+	updateAuth := solana.PublicKey{}
+	copy(updateAuth[:], data[1:33])
+	metadata.UpdateAuth = updateAuth.String()
+
+	mint := solana.PublicKey{}
+	copy(mint[:], data[33:65])
+	metadata.Mint = mint.String()
+
+	// Attempt to extract name, symbol, URI
+	// This is very simplified and may not work for all tokens
+	if len(data) > 69 {
+		nameLen := binary.LittleEndian.Uint32(data[65:69])
+		startPos := 69
+
+		if len(data) >= startPos+int(nameLen) {
+			metadata.Data.Name = string(data[startPos : startPos+int(nameLen)])
+			startPos += int(nameLen)
+
+			if len(data) >= startPos+4 {
+				symbolLen := binary.LittleEndian.Uint32(data[startPos : startPos+4])
+				startPos += 4
+
+				if len(data) >= startPos+int(symbolLen) {
+					metadata.Data.Symbol = string(data[startPos : startPos+int(symbolLen)])
+					startPos += int(symbolLen)
+
+					if len(data) >= startPos+4 {
+						uriLen := binary.LittleEndian.Uint32(data[startPos : startPos+4])
+						startPos += 4
+
+						if len(data) >= startPos+int(uriLen) {
+							metadata.Data.Uri = string(data[startPos : startPos+int(uriLen)])
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return metadata, nil
+}
+
+// fetchTokenUriData retrieves extended token metadata from URI
+func fetchTokenUriData(uri string) (*TokenUriData, error) {
+	if uri == "" {
+		return nil, fmt.Errorf("empty URI")
+	}
+
+	// Clean up the URI
+	uri = strings.TrimSpace(uri)
+
+	// Handle IPFS URIs
+	if strings.HasPrefix(uri, "ipfs://") {
+		uri = strings.Replace(uri, "ipfs://", "https://ipfs.io/ipfs/", 1)
+	}
+
+	// Set up a timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Create request
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Execute request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch URI: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check if it's a JSON response
+	contentType := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "application/json") || strings.Contains(uri, ".json") {
+		var data TokenUriData
+		err = json.Unmarshal(body, &data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		return &data, nil
+	} else if strings.HasPrefix(contentType, "image/") {
+		// Just a simple image, return minimal data
+		return &TokenUriData{
+			Image: uri,
+		}, nil
+	} else {
+		// Try to parse as JSON anyway
+		var data TokenUriData
+		err = json.Unmarshal(body, &data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse unknown content type: %w", err)
+		}
+		return &data, nil
+	}
 }
