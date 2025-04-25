@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"solana-pumpswap-demo/internal/swapper"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 	token "github.com/gagliardetto/solana-go/programs/token"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/gagliardetto/solana-go/rpc/ws"
 	"github.com/mr-tron/base58"
 )
 
@@ -60,6 +63,16 @@ type TokenInfo struct {
 	Website     string
 	Twitter     string
 	Telegram    string
+}
+
+type PumpSwapPoolInfo struct {
+	PoolAddress                      string
+	BaseMint                         string // Token mint (e.g., PUMP token)
+	QuoteMint                        string // WSOL mint
+	PoolBaseTokenAccount             string // Pool's token account
+	PoolQuoteTokenAccount            string // Pool's SOL account
+	ProtocolFeeRecipient             string // Must be one of the valid addresses
+	ProtocolFeeRecipientTokenAccount string // Token account for fee recipient
 }
 
 // TokenMetadata represents token metadata from the chain
@@ -164,6 +177,9 @@ func main() {
 					os.Exit(1)
 				}
 			}
+		case "monitor":
+			// New command to monitor transactions in real-time using WebSocket
+			monitorAccountCmd()
 		default:
 			// If this is a pool address for decoding, pass it along
 			if len(os.Args[1]) > 30 {
@@ -180,6 +196,174 @@ func main() {
 	}
 }
 
+// monitorAccountCmd monitors transactions for an account in real-time using WebSocket
+func monitorAccountCmd() {
+	// Get the account address to monitor from args or use default
+	accountAddress := "Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3" // Default smart money account
+	if len(os.Args) > 2 {
+		accountAddress = os.Args[2]
+	}
+
+	fmt.Printf("Starting real-time monitoring for account: %s\n", accountAddress)
+	fmt.Println("Press Ctrl+C to exit")
+
+	// Get RPC endpoint from environment or use default
+	rpcEndpoint := os.Getenv("RPC_ENDPOINT")
+	if rpcEndpoint == "" {
+		rpcEndpoint = fallbackRPCEndpoints[0]
+	}
+
+	// Get WebSocket endpoint from environment or derive from RPC endpoint
+	wsEndpoint := os.Getenv("WS_ENDPOINT")
+	if wsEndpoint == "" {
+		wsEndpoint = "wss://api.mainnet-beta.solana.com"
+	}
+
+	// Convert account address to PublicKey
+	accountPubkey, err := solana.PublicKeyFromBase58(accountAddress)
+	if err != nil {
+		log.Fatalf("Invalid account address: %v", err)
+	}
+
+	// Create context with cancellation for proper shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle Ctrl+C to gracefully exit
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		fmt.Println("\nShutting down WebSocket connection...")
+		cancel()
+		time.Sleep(1 * time.Second) // Give time for cleanup
+		os.Exit(0)
+	}()
+
+	// Create regular RPC client for transaction details
+	rpcClient := rpc.New(rpcEndpoint)
+
+	// Connect to WebSocket endpoint with retry logic
+	var wsClient *ws.Client
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
+		fmt.Printf("Connecting to WebSocket endpoint: %s (attempt %d/%d)\n", wsEndpoint, retryCount+1, maxRetries)
+		wsClient, err = ws.Connect(ctx, wsEndpoint)
+		if err == nil {
+			break
+		}
+		fmt.Printf("Failed to connect to WebSocket: %v\n", err)
+		if retryCount < maxRetries-1 {
+			time.Sleep(time.Duration(retryCount+1) * time.Second)
+		}
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to connect to WebSocket after %d attempts: %v", maxRetries, err)
+	}
+	defer wsClient.Close()
+
+	fmt.Println("Successfully connected to WebSocket")
+
+	// Subscribe to logs that mention the account
+	// Using CommitmentConfirmed for better balance between speed and reliability
+	sub, err := wsClient.LogsSubscribeMentions(
+		accountPubkey,
+		rpc.CommitmentProcessed,
+	)
+	if err != nil {
+		log.Fatalf("Failed to subscribe to logs: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	fmt.Printf("Successfully subscribed to logs for account: %s\n", accountAddress)
+	fmt.Println("Waiting for transactions...")
+
+	// Transaction counter
+	txCount := 0
+
+	// Channel to receive transaction notifications
+	transactionChan := make(chan *ws.LogResult, 10)
+
+	// Start a goroutine to receive logs
+	go func() {
+		for {
+			logResult, err := sub.Recv(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					// Context was canceled, exit gracefully
+					return
+				}
+				fmt.Printf("Error receiving log: %v\n", err)
+				// Brief pause before retrying
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			// Send the transaction to the processing channel
+			transactionChan <- logResult
+		}
+	}()
+
+	// Process incoming transactions from the channel
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case logResult := <-transactionChan:
+			// A transaction involving the account was detected
+			txCount++
+			txSignature := logResult.Value.Signature.String()
+			fmt.Printf("\n[%d] Transaction detected: %s\n", txCount, txSignature)
+
+			// Print transaction logs if available
+			if len(logResult.Value.Logs) > 0 {
+				fmt.Println("Transaction logs:")
+				for i, log := range logResult.Value.Logs {
+					if i < 5 { // Only show first 5 logs to avoid flooding the console
+						fmt.Printf("  %s\n", log)
+					} else {
+						fmt.Printf("  ...and %d more log entries\n", len(logResult.Value.Logs)-5)
+						break
+					}
+				}
+			}
+
+			// Get transaction details with retry logic
+			var tx *rpc.GetTransactionResult
+			for retryCount := 0; retryCount < maxRetries; retryCount++ {
+				tx, err = rpcClient.GetTransaction(ctx, logResult.Value.Signature, &rpc.GetTransactionOpts{
+					Encoding:   solana.EncodingBase64,
+					Commitment: rpc.CommitmentConfirmed,
+				})
+
+				if err == nil {
+					break
+				}
+
+				if retryCount < maxRetries-1 {
+					fmt.Printf("Failed to get transaction details (attempt %d/%d): %v\nRetrying...\n",
+						retryCount+1, maxRetries, err)
+					time.Sleep(time.Duration(retryCount+1) * time.Second)
+				}
+			}
+
+			if err != nil {
+				fmt.Printf("Error getting transaction details after %d attempts: %v\n", maxRetries, err)
+				fmt.Printf("You can view this transaction on Solana Explorer: https://explorer.solana.com/tx/%s\n",
+					txSignature)
+				continue
+			}
+
+			// Process the transaction
+			fmt.Println("Analyzing transaction...")
+			analyzeTransactionWithRPC(tx, txSignature, rpcEndpoint)
+
+			// Give a visual separator for the next transaction
+			fmt.Println("\nWaiting for next transaction...")
+		}
+	}
+}
+
 // decodeTxCmd decodes transactions for a given PumpFun AMM pool
 func decodeTxCmd() {
 	// Get RPC endpoint from environment or use default
@@ -188,13 +372,13 @@ func decodeTxCmd() {
 		rpcEndpoint = fallbackRPCEndpoints[0]
 	}
 
-	// Get the pool address to monitor from args or use default
-	poolAddress := "H9d3XHfvMGfoohydEpqh4w3mopnvjCRzE9VqaiHKdqs7" // Default pool address
+	// Get the account address to monitor from args or use default
+	accountAddress := "Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3" // Default pool address
 	if len(os.Args) > 1 {
-		poolAddress = os.Args[1]
+		accountAddress = os.Args[1]
 	}
 
-	fmt.Printf("Analyzing transactions for PumpFun AMM pool: %s\n", poolAddress)
+	fmt.Printf("Analyzing transactions for AccountAddress: %s\n", accountAddress)
 
 	// Create context with cancellation and timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -212,7 +396,7 @@ func decodeTxCmd() {
 
 	// Fetch and decode historical transactions
 	limit := 10 // Default limit
-	err := getHistoricalTransactions(ctx, rpcEndpoint, poolAddress, limit)
+	err := getHistoricalTransactions(ctx, rpcEndpoint, accountAddress, limit)
 	if err != nil {
 		fmt.Printf("Error with primary RPC endpoint: %v\n", err)
 		fmt.Println("Trying fallback RPC endpoints...")
@@ -226,7 +410,7 @@ func decodeTxCmd() {
 
 			fmt.Printf("Trying fallback endpoint #%d: %s\n", i+1, endpoint)
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			err := getHistoricalTransactions(ctx, endpoint, poolAddress, limit)
+			err := getHistoricalTransactions(ctx, endpoint, accountAddress, limit)
 			cancel()
 
 			if err == nil {
@@ -260,6 +444,9 @@ func getHistoricalTransactions(ctx context.Context, rpcEndpoint, accountAddress 
 		if err == nil {
 			break
 		}
+
+		//output  the length of signatures
+		fmt.Println("len of signatures:", len(signatures))
 
 		if retryCount < maxRetries-1 {
 			fmt.Printf("Failed to get signatures (attempt %d/%d): %v\nRetrying...\n",
@@ -454,6 +641,47 @@ func analyzeTransactionWithRPC(tx *rpc.GetTransactionResult, signature string, r
 											fmt.Printf("    Base Amount Out: %d (tokens received)\n", baseAmountOut)
 											fmt.Printf("    Max Quote Amount In: %d (max SOL to spend)\n", maxQuoteAmountIn)
 										}
+
+										privateKeyStr := os.Getenv("PRIVATE_KEY")
+										WrappedSOL := "So11111111111111111111111111111111111111112" // Wrapped SOL address
+										// Valid protocol fee recipients - must use one of these
+										var validProtocolFeeRecipients = []string{
+											"62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+											"7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
+											"7hTckgnGnLQR6sdH7YkqFTAA7VwTfYFaZ6EhEsU3saCX",
+											"9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz",
+											"AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY",
+											"FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz",
+											"G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP",
+										}
+										poolInfo := swapper.PumpSwapPoolInfo{
+											PoolAddress:                      "H9d3XHfvMGfoohydEpqh4w3mopnvjCRzE9VqaiHKdqs7",
+											BaseMint:                         "4TBi66vi32S7J8X1A6eWfaLHYmUXu7CStcEmsJQdpump", // PUMP token
+											QuoteMint:                        WrappedSOL,                                     // Wrapped SOL
+											PoolBaseTokenAccount:             "4vDmqnKLN2jdPGR2DMf5L6C93AG4XbHdfRAXJuironK8", // Example
+											PoolQuoteTokenAccount:            "5mDDjsgR9HQGFjHGy1cZ7fNYMzqkZ9hBeAJbjkcTZgCt", // Example
+											ProtocolFeeRecipient:             validProtocolFeeRecipients[1],                  // Using the first valid recipient
+											ProtocolFeeRecipientTokenAccount: "7NXr6RhzBFo4Ki9pUEVyD3fULvTw7PzGiwzxNk3gboYh", // Example
+										}
+										amountIn := strconv.FormatUint(summary.AmountIn, 10)
+										slippage := uint64(100)
+										signature, err := swapper.ExecutePumpSwap(
+											context.Background(),
+											rpcEndpoint,
+											privateKeyStr,
+											poolInfo,
+											amountIn,
+											slippage,
+											isBuy,
+										)
+										if err != nil {
+											fmt.Println("err execution pump swap:", err)
+										}
+
+										fmt.Println("the signature is:", signature)
+
+										//TODO: exit the program
+										os.Exit(1)
 
 									} else if bytes.Equal(currentDiscriminator, SellDiscriminator) {
 										isSwapInstruction = true
@@ -792,9 +1020,12 @@ Usage:
 
 Commands:
   decode [pool_address]       Analyze transactions for a PumpFun AMM pool
-                              Default pool: H9d3XHfvMGfoohydEpqh4w3mopnvjCRzE9VqaiHKdqs7
+                              Default pool: Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3
   
   decode-tx <tx_signature>    Decode a specific transaction by signature
+
+  monitor [account_address]   Monitor transactions for an account in real-time using WebSocket
+                              Default account: Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3
 
 Options:
   -h, --help                  Show this help message
@@ -803,10 +1034,13 @@ Environment Variables:
   RPC_ENDPOINT                Solana RPC endpoint (default: https://api.mainnet-beta.solana.com)
                               If the default endpoint fails, the program will try several
                               fallback public endpoints automatically.
+  
+  WS_ENDPOINT                 Solana WebSocket endpoint (default: wss://api.mainnet-beta.solana.com)
 
 Examples:
-  tx_decoder decode H9d3XHfvMGfoohydEpqh4w3mopnvjCRzE9VqaiHKdqs7
+  tx_decoder decode Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3
   tx_decoder decode-tx 5SHT9PwxFE7BNmSQwU4KjAW16LQ5aEZmUvWKqSCamXKkWQBs1DcYkEv7ujWgASRUUKqYy6VsM7iTgJkgAygCVPZB
+  tx_decoder monitor Csd779Qwsrf1FH1eeLQnNDcxknyCvJteJtVW2MLFr4y3
 `)
 }
 

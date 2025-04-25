@@ -89,7 +89,7 @@ func main() {
 	isBuy := true           // We're buying PUMP tokens with SOL
 
 	// Execute the swap
-	txSignature, err := executePumpSwap(
+	txSignature, err := ExecutePumpSwap(
 		context.Background(),
 		rpcEndpoint,
 		privateKeyStr,
@@ -129,7 +129,7 @@ type CreateMarketTx struct {
 }
 
 // executePumpSwap executes a PumpSwap transaction
-func executePumpSwap(
+func ExecutePumpSwap(
 	ctx context.Context,
 	rpcEndpoint string,
 	privateKeyStr string,
@@ -320,8 +320,11 @@ func executePumpSwap(
 	poolTokenAccount, _ := ag_solanago.PublicKeyFromBase58(PoolBaseTokenAccount)
 	poolSolAccount, _ := ag_solanago.PublicKeyFromBase58(PoolQuoteTokenAccount)
 
+	fmt.Println("poolTokenAccount", poolTokenAccount)
+	fmt.Println("poolSolAccount", poolSolAccount)
 	//TODO: It fetches the current token balances(reserves)
 	amounts, err := GetMulTokenBalance(ctx, cli, poolTokenAccount, poolSolAccount)
+	fmt.Println("amounts is:", amounts)
 
 	//TODO: feeRecipientAccount
 	feeRecipientAccount := "7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ"
@@ -357,6 +360,7 @@ func executePumpSwap(
 		BaseTokenProgram:                 ag_solanago.MustPublicKeyFromBase58(baseTokenProgram),
 		QuoteTokenProgram:                ag_solanago.MustPublicKeyFromBase58(quoteTokenProgram),
 	}
+
 	// Create swap instruction data (placeholder - would need actual instruction data format)
 	var instructionData []byte
 	if isBuy {
